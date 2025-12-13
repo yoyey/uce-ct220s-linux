@@ -1,0 +1,13 @@
+[package]
+name = "ct220s_viewer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.24"
+egui = "0.24"
+hidapi = "2.4"
+byteorder = "1.5"
+clap = { version = "4.4", features = ["derive"] }
+image = "0.24"
+crossbeam-channel = "0.5"

@@ -313,7 +313,7 @@ impl eframe::App for CT220SApp {
 
                 ui.horizontal(|ui| {
                     ui.label("Fréquence:");
-                    if ui.button("100Hz").clicked() {
+                    if ui.button("10Hz").clicked() {
                         if let Err(e) = backend.lock().unwrap().send_cmd(Command::SetFreq(0)) {
                             *self.error_message.lock().unwrap() =
                                 Some(format!("❌ Erreur cmd: {}", e));
@@ -322,7 +322,7 @@ impl eframe::App for CT220SApp {
                                 Some("✅ Fréquence: 100Hz".to_string());
                         }
                     }
-                    if ui.button("1kHz").clicked() {
+                    if ui.button("100Hz").clicked() {
                         if let Err(e) = backend.lock().unwrap().send_cmd(Command::SetFreq(1)) {
                             *self.error_message.lock().unwrap() =
                                 Some(format!("❌ Erreur cmd: {}", e));
@@ -331,7 +331,7 @@ impl eframe::App for CT220SApp {
                                 Some("✅ Fréquence: 1kHz".to_string());
                         }
                     }
-                    if ui.button("10kHz").clicked() {
+                    if ui.button("500Hz").clicked() {
                         if let Err(e) = backend.lock().unwrap().send_cmd(Command::SetFreq(2)) {
                             *self.error_message.lock().unwrap() =
                                 Some(format!("❌ Erreur cmd: {}", e));
@@ -340,12 +340,23 @@ impl eframe::App for CT220SApp {
                                 Some("✅ Fréquence: 10kHz".to_string());
                         }
                     }
+                    if ui.button("2kHz").clicked() {
+                        if let Err(e) = backend.lock().unwrap().send_cmd(Command::SetFreq(3)) {
+                            *self.error_message.lock().unwrap() =
+                                Some(format!("❌ Erreur cmd: {}", e));
+                        } else {
+                            *self.error_message.lock().unwrap() =
+                                Some("✅ Fréquence: 10kHz".to_string());
+                        }
+                    }
+
+
                 });
 
                 ui.horizontal(|ui| {
-                    ui.label("Résolution:");
-                    if ui.button("Basse").clicked() {
-                        if let Err(e) = backend.lock().unwrap().send_cmd(Command::SetRes(0)) {
+                    ui.label("Résistance:");
+                    if ui.button("47R").clicked() {
+                        if let Err(e) = backend.lock().unwrap().send_cmd(Command::SetRes(2)) {
                             *self.error_message.lock().unwrap() =
                                 Some(format!("❌ Erreur cmd: {}", e));
                         } else {
@@ -353,7 +364,7 @@ impl eframe::App for CT220SApp {
                                 Some("✅ Résolution: Basse".to_string());
                         }
                     }
-                    if ui.button("Haute").clicked() {
+                    if ui.button("1K").clicked() {
                         if let Err(e) = backend.lock().unwrap().send_cmd(Command::SetRes(1)) {
                             *self.error_message.lock().unwrap() =
                                 Some(format!("❌ Erreur cmd: {}", e));
@@ -362,6 +373,25 @@ impl eframe::App for CT220SApp {
                                 Some("✅ Résolution: Haute".to_string());
                         }
                     }
+                    if ui.button("10K").clicked() {
+                        if let Err(e) = backend.lock().unwrap().send_cmd(Command::SetRes(0)) {
+                            *self.error_message.lock().unwrap() =
+                                Some(format!("❌ Erreur cmd: {}", e));
+                        } else {
+                            *self.error_message.lock().unwrap() =
+                                Some("✅ Résolution: Basse".to_string());
+                        }
+                    }
+                    if ui.button("offset").clicked() {
+                        if let Err(e) = backend.lock().unwrap().send_cmd(Command::SetRes(0)) {
+                            *self.error_message.lock().unwrap() =
+                                Some(format!("❌ Erreur cmd: {}", e));
+                        } else {
+                            *self.error_message.lock().unwrap() =
+                                Some("✅ Résolution: Haute".to_string());
+                        }
+                    }
+
                 });
 
                 ui.horizontal(|ui| {
@@ -388,7 +418,7 @@ impl eframe::App for CT220SApp {
 
                 ui.horizontal(|ui| {
                     ui.label("Voltage:");
-                    if ui.button("3.3V").clicked() {
+                    if ui.button("2.5").clicked() {
                         if let Err(e) = backend.lock().unwrap().send_cmd(Command::SetVolt(0)) {
                             *self.error_message.lock().unwrap() =
                                 Some(format!("❌ Erreur cmd: {}", e));
@@ -399,6 +429,24 @@ impl eframe::App for CT220SApp {
                     }
                     if ui.button("5V").clicked() {
                         if let Err(e) = backend.lock().unwrap().send_cmd(Command::SetVolt(1)) {
+                            *self.error_message.lock().unwrap() =
+                                Some(format!("❌ Erreur cmd: {}", e));
+                        } else {
+                            *self.error_message.lock().unwrap() =
+                                Some("✅ Voltage: 5V".to_string());
+                        }
+                    }
+                    if ui.button("10V").clicked() {
+                        if let Err(e) = backend.lock().unwrap().send_cmd(Command::SetVolt(2)) {
+                            *self.error_message.lock().unwrap() =
+                                Some(format!("❌ Erreur cmd: {}", e));
+                        } else {
+                            *self.error_message.lock().unwrap() =
+                                Some("✅ Voltage: 5V".to_string());
+                        }
+                    }                    
+                    if ui.button("20V").clicked() {
+                        if let Err(e) = backend.lock().unwrap().send_cmd(Command::SetVolt(3)) {
                             *self.error_message.lock().unwrap() =
                                 Some(format!("❌ Erreur cmd: {}", e));
                         } else {

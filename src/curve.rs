@@ -36,7 +36,6 @@ pub struct ElectricalValues {
     pub capacitance_f: Option<f32>,
     pub inductance_h: Option<f32>,
     pub phase_deg: Option<f32>,
-    pub impedance_ohm: Option<f32>,
 }
 
 /// Parse les bytes bruts d'une courbe + normalisation comme dans le script Python.
@@ -187,7 +186,6 @@ pub fn calculate_electrical_values(
                 capacitance_f: None,
                 inductance_h: None,
                 phase_deg: None,
-                impedance_ohm: Some(0.0),
             };
         }
     };
@@ -206,7 +204,6 @@ pub fn calculate_electrical_values(
             capacitance_f: None,
             inductance_h: None,
             phase_deg: None,
-            impedance_ohm: Some(z_ohm.max(0.0)),
         };
     }
 
@@ -216,7 +213,6 @@ pub fn calculate_electrical_values(
 
     let mut result = ElectricalValues {
         phase_deg: Some(phase_deg),
-        impedance_ohm: Some(z_ohm),
         ..ElectricalValues::default()
     };
 

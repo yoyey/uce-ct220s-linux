@@ -5,7 +5,8 @@ use crate::curve::{parse_and_normalize_curve_data, CurveData, DualCurveData};
 
 use hidapi::{HidApi, HidDevice};
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -15,13 +16,30 @@ use std::time::Duration;
 pub enum Command {
     SetFreq(u8), // FC
     SetRes(u8),  // FB
-    SetMode(u8), // FA
+    #[allow(dead_code)]
+    SetMode(u8), // FA - conservé pour le protocole USB
     SetVolt(u8), // FD
 }
 
 /// Backend HID pour envoyer des commandes
 pub struct HidBackend {
     device: Arc<Mutex<HidDevice>>,
+}
+
+/// Construit exactement le même rapport HID que celui envoyé au vrai boîtier.
+pub fn encode_command_report(cmd: Command) -> [u8; READ_SIZE] {
+    let (prefix, index) = match cmd {
+        Command::SetFreq(i) => (0xFCu8, i),
+        Command::SetRes(i) => (0xFBu8, i),
+        Command::SetMode(i) => (0xFAu8, i),
+        Command::SetVolt(i) => (0xFDu8, i),
+    };
+
+    let mut buf = [0u8; READ_SIZE];
+    buf[0] = 0; // Report ID HID
+    buf[1] = prefix;
+    buf[2] = index;
+    buf
 }
 
 impl HidBackend {
@@ -43,23 +61,13 @@ impl HidBackend {
 
     /// Envoyer une commande au boîtier
     pub fn send_cmd(&self, cmd: Command) -> Result<(), String> {
-        let (prefix, index) = match cmd {
-            Command::SetFreq(i) => (0xFCu8, i),
-            Command::SetRes(i) => (0xFBu8, i),
-            Command::SetMode(i) => (0xFAu8, i),
-            Command::SetVolt(i) => (0xFDu8, i),
-        };
-
-        let mut buf = [0u8; READ_SIZE];
-        buf[1] = prefix;
-        buf[2] = index;
-
+        let buf = encode_command_report(cmd);
         let device = self.device.lock().unwrap();
         device.write(&buf).map_err(|e| e.to_string())?;
-        
+
         println!(
             "Cmd HID envoyée: prefix=0x{:02X}, index={}",
-            prefix, index
+            buf[1], buf[2]
         );
         Ok(())
     }
@@ -164,6 +172,134 @@ pub fn run_file_reader(
     Ok(())
 }
 
+
+/// Envoie au simulateur TCP exactement le même rapport 65 octets que
+/// celui utilisé par HID pour le vrai boîtier (Report ID + FA/FB/FC/FD).
+pub fn send_tcp_cmd(
+    command_stream: &Arc<Mutex<Option<TcpStream>>>,
+    cmd: Command,
+) -> Result<(), String> {
+    let report = encode_command_report(cmd);
+    let mut guard = command_stream.lock().unwrap();
+    let stream = guard
+        .as_mut()
+        .ok_or_else(|| "Simulateur TCP non connecté".to_string())?;
+    stream.write_all(&report).map_err(|e| e.to_string())?;
+    println!(
+        "Cmd TCP envoyée (protocole HID inchangé): prefix=0x{:02X}, index={}",
+        report[1], report[2]
+    );
+    Ok(())
+}
+
+/// Lecture de courbes via TCP (simulateur externe).
+///
+/// Le protocole est volontairement simple et reprend les rapports HID bruts :
+/// - 1 rapport de 64 octets commençant par F0 FF, octet 2 = canal
+/// - 32 rapports de 64 octets contenant 512 couples (I,V) u16 little-endian
+///
+/// Le viewer écoute sur `address` (par défaut 127.0.0.1:3000 avec --tcp).
+pub fn run_tcp_reader(
+    address: &str,
+    curve_data: Arc<Mutex<DualCurveData>>,
+    error_message: Arc<Mutex<Option<String>>>,
+    running: Arc<Mutex<bool>>,
+    command_stream: Arc<Mutex<Option<TcpStream>>>,
+) -> Result<(), String> {
+    let listener = TcpListener::bind(address)
+        .map_err(|e| format!("Impossible d'écouter sur {}: {}", address, e))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("Impossible de passer le socket en non-bloquant: {}", e))?;
+
+    println!("Mode simulateur TCP: écoute sur {}", address);
+    *error_message.lock().unwrap() = Some(format!("Simulation TCP: attente sur {}", address));
+
+    while *running.lock().unwrap() {
+        match listener.accept() {
+            Ok((mut stream, peer)) => {
+                println!("Simulateur connecté depuis {}", peer);
+                *error_message.lock().unwrap() =
+                    Some(format!("Simulateur connecté: {}", peer));
+
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
+                let _ = stream.set_nodelay(true);
+
+                match stream.try_clone() {
+                    Ok(writer) => {
+                        let _ = writer.set_nodelay(true);
+                        *command_stream.lock().unwrap() = Some(writer);
+                    }
+                    Err(e) => {
+                        *error_message.lock().unwrap() = Some(format!("Erreur clone TCP: {}", e));
+                        continue;
+                    }
+                }
+
+                while *running.lock().unwrap() {
+                    match read_one_curve_tcp(&mut stream) {
+                        Ok(curve) => {
+                            let mut data = curve_data.lock().unwrap();
+                            if curve.channel == 0 {
+                                data.channel0 = Some(curve);
+                            } else {
+                                data.channel1 = Some(curve);
+                            }
+                            *error_message.lock().unwrap() = None;
+                        }
+                        Err(e) => {
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                || e.kind() == std::io::ErrorKind::TimedOut
+                            {
+                                continue;
+                            }
+
+                            println!("Simulateur TCP déconnecté: {}", e);
+                            *command_stream.lock().unwrap() = None;
+                            *error_message.lock().unwrap() =
+                                Some(format!("Simulation TCP: attente sur {}", address));
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => {
+                return Err(format!("Erreur accept TCP: {}", e));
+            }
+        }
+    }
+
+    *command_stream.lock().unwrap() = None;
+    Ok(())
+}
+
+fn read_one_curve_tcp(stream: &mut TcpStream) -> std::io::Result<CurveData> {
+    // Le flux est découpé en rapports fixes de 64 octets. On resynchronise
+    // simplement jusqu'à retrouver F0 FF.
+    let channel_id = loop {
+        let mut header = [0u8; REPORT_DATA_SIZE];
+        stream.read_exact(&mut header)?;
+        if header[0] == HEADER_MAGIC[0] && header[1] == HEADER_MAGIC[1] {
+            break header[2];
+        }
+    };
+
+    let mut data_bytes = vec![0u8; REPORTS_PER_CURVE * REPORT_DATA_SIZE];
+    stream.read_exact(&mut data_bytes)?;
+
+    let (v_norm, i_norm) = parse_and_normalize_curve_data(&data_bytes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+    Ok(CurveData {
+        voltage: v_norm,
+        current: i_norm,
+        channel: channel_id,
+    })
+}
+
 /// Parsing d'une ligne hex (capture fichier)
 fn parse_hex_line(line: &str) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
@@ -200,31 +336,23 @@ fn read_one_curve_from_reports(
     reports: &[Vec<u8>],
     start_idx: &mut usize,
 ) -> Result<CurveData, String> {
-    let mut channel_id = 1u8;
-    let mut header_found = false;
+    let channel_id = loop {
+        if *start_idx >= reports.len() {
+            return Err("Pas de header trouvé".to_string());
+        }
 
-    while *start_idx < reports.len() {
         if let Some(payload) = extract_payload(&reports[*start_idx]) {
             if payload.len() >= 3
                 && payload[0] == HEADER_MAGIC[0]
                 && payload[1] == HEADER_MAGIC[1]
             {
-                channel_id = payload[2];
-                header_found = true;
                 *start_idx += 1;
-                break;
+                break payload[2];
             }
         }
+
         *start_idx += 1;
-    }
-
-    if !header_found {
-        return Err("Pas de header trouvé".to_string());
-    }
-
-    if *start_idx + REPORTS_PER_CURVE > reports.len() {
-        return Err("Pas assez de rapports restants".to_string());
-    }
+    };
 
     let mut data_bytes = Vec::with_capacity(REPORTS_PER_CURVE * REPORT_DATA_SIZE);
     for i in 0..REPORTS_PER_CURVE {
@@ -246,10 +374,8 @@ fn read_one_curve_from_reports(
 }
 
 fn read_one_curve(device: &HidDevice) -> Result<CurveData, String> {
-    let mut channel_id = 1u8;
-
-    // Attendre le header
-    loop {
+    // Attendre le header et récupérer directement le canal.
+    let channel_id = loop {
         let mut buf = [0u8; READ_SIZE];
         let n = device
             .read(&mut buf)
@@ -260,11 +386,10 @@ fn read_one_curve(device: &HidDevice) -> Result<CurveData, String> {
                 && payload[0] == HEADER_MAGIC[0]
                 && payload[1] == HEADER_MAGIC[1]
             {
-                channel_id = payload[2];
-                break;
+                break payload[2];
             }
         }
-    }
+    };
 
     // Lire les données
     let mut data_bytes = Vec::with_capacity(REPORTS_PER_CURVE * REPORT_DATA_SIZE);

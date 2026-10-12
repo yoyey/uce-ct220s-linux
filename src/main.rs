@@ -16,6 +16,10 @@ struct Args {
     /// Chemin vers un fichier de capture hexadécimal
     #[arg(short, long)]
     file: Option<String>,
+
+    /// Écoute un simulateur TCP. Sans valeur : 127.0.0.1:3000
+    #[arg(long, value_name = "ADDR", num_args = 0..=1, default_missing_value = "127.0.0.1:3000")]
+    tcp: Option<String>,
 }
 
 fn main() -> Result<(), eframe::Error> {
@@ -29,7 +33,7 @@ fn main() -> Result<(), eframe::Error> {
     eframe::run_native(
         "CT220S V-I Curve Viewer",
         options,
-        Box::new(move |cc| Box::new(CT220SApp::new(cc, args.file.clone()))),
+        Box::new(move |cc| Box::new(CT220SApp::new(cc, args.file.clone(), args.tcp.clone()))),
     )
 }
 

@@ -1,0 +1,8 @@
+[package]
+name = "ct220s_simulator"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.24"
+egui = "0.24"

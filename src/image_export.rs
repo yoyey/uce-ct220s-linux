@@ -1,222 +1,127 @@
 // src/image_export.rs
+//
+// Rendu hors écran des courbes (export image, rapport PDF) et export texte
+// au format du logiciel constructeur.
 
-use crate::curve::{CurveData, DualCurveData};
-use image::{ImageBuffer, Rgba};
+use crate::curve::CurveData;
+use image::{Rgb, RgbImage};
 
-pub fn save_curve_as_png(curve: &CurveData, filename: &str) -> Result<(), String> {
-    let width = 800;
-    let height = 800;
-
-    let mut img = ImageBuffer::from_fn(width, height, |_, _| {
-        Rgba([255u8, 255u8, 255u8, 255u8])
-    });
-
-    let center_x = width as f32 / 2.0;
-    let center_y = height as f32 / 2.0;
-    let scale = (width.min(height) as f32) * 0.45;
-
-    let grid_color = Rgba([200u8, 200u8, 200u8, 255u8]);
-    for i in -10..=10 {
-        let offset = (i as f32) * scale / 10.0;
-
-        let x = (center_x + offset) as i32;
-        if x >= 0 && x < width as i32 {
-            for y in 0..height {
-                if let Some(pixel) = img.get_pixel_mut_checked(x as u32, y) {
-                    *pixel = grid_color;
-                }
-            }
-        }
-
-        let y = (center_y + offset) as i32;
-        if y >= 0 && y < height as i32 {
-            for x in 0..width {
-                if let Some(pixel) = img.get_pixel_mut_checked(x, y as u32) {
-                    *pixel = grid_color;
-                }
-            }
-        }
-    }
-
-    let axis_color = Rgba([0u8, 0u8, 0u8, 255u8]);
-
-    let cy = center_y as i32;
-    for x in 0..width {
-        for dy in -1..=1 {
-            let y = cy + dy;
-            if y >= 0 && y < height as i32 {
-                if let Some(pixel) = img.get_pixel_mut_checked(x, y as u32) {
-                    *pixel = axis_color;
-                }
-            }
-        }
-    }
-
-    let cx = center_x as i32;
-    for y in 0..height {
-        for dx in -1..=1 {
-            let x = cx + dx;
-            if x >= 0 && x < width as i32 {
-                if let Some(pixel) = img.get_pixel_mut_checked(x as u32, y) {
-                    *pixel = axis_color;
-                }
-            }
-        }
-    }
-
-    let curve_color = Rgba([0u8, 100u8, 255u8, 255u8]);
-
-    for i in 0..curve.voltage.len() {
-        let v = curve.voltage[i];
-        let c = curve.current[i];
-
-        let x = (center_x + v * scale) as i32;
-        let y = (center_y - c * scale) as i32;
-
-        for dy in -1..=1 {
-            for dx in -1..=1 {
-                let px = x + dx;
-                let py = y + dy;
-
-                if px >= 0 && px < width as i32 && py >= 0 && py < height as i32 {
-                    if let Some(pixel) = img.get_pixel_mut_checked(px as u32, py as u32) {
-                        *pixel = curve_color;
-                    }
-                }
-            }
-        }
-    }
-
-    img.save(filename)
-        .map_err(|e| format!("Erreur sauvegarde PNG: {}", e))?;
-
-    println!("Image sauvegardée : {}", filename);
-    Ok(())
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlotScale {
+    /// Points ADC 0..4095 sur les deux axes (affichage constructeur).
+    Fixed,
+    /// Courbe centrée et agrandie (échelle commune V/I).
+    Auto,
 }
 
-pub fn save_dual_curves_as_png(data: &DualCurveData, filename: &str) -> Result<(), String> {
-    let width = 1600;
-    let height = 800;
-
-    let mut img = ImageBuffer::from_fn(width, height, |_, _| {
-        Rgba([255u8, 255u8, 255u8, 255u8])
-    });
-
-    if let Some(ch0) = &data.channel0 {
-        draw_curve_to_image(
-            &mut img,
-            ch0,
-            0,
-            0,
-            800,
-            800,
-            Rgba([255u8, 100u8, 0u8, 255u8]),
-        );
-    }
-
-    if let Some(ch1) = &data.channel1 {
-        draw_curve_to_image(
-            &mut img,
-            ch1,
-            800,
-            0,
-            800,
-            800,
-            Rgba([0u8, 100u8, 255u8, 255u8]),
-        );
-    }
-
-    img.save(filename)
-        .map_err(|e| format!("Erreur sauvegarde PNG: {}", e))?;
-
-    println!("Image dual sauvegardée : {}", filename);
-    Ok(())
+pub struct Trace<'a> {
+    pub curve: &'a CurveData,
+    pub color: [u8; 3],
+    pub width: i32,
 }
 
-fn draw_curve_to_image(
-    img: &mut ImageBuffer<Rgba<u8>, Vec<u8>>,
-    curve: &CurveData,
-    offset_x: u32,
-    offset_y: u32,
-    w: u32,
-    h: u32,
-    curve_color: Rgba<u8>,
-) {
-    let center_x = offset_x as f32 + w as f32 / 2.0;
-    let center_y = offset_y as f32 + h as f32 / 2.0;
-    let scale = (w.min(h) as f32) * 0.45;
-
-    let grid_color = Rgba([200u8, 200u8, 200u8, 255u8]);
-    for i in -10..=10 {
-        let off = (i as f32) * scale / 10.0;
-
-        let x = (center_x + off) as i32;
-        if x >= offset_x as i32 && x < (offset_x + w) as i32 {
-            for y in offset_y..(offset_y + h) {
-                if let Some(pixel) = img.get_pixel_mut_checked(x as u32, y) {
-                    *pixel = grid_color;
-                }
-            }
-        }
-
-        let y = (center_y + off) as i32;
-        if y >= offset_y as i32 && y < (offset_y + h) as i32 {
-            for x in offset_x..(offset_x + w) {
-                if let Some(pixel) = img.get_pixel_mut_checked(x, y as u32) {
-                    *pixel = grid_color;
-                }
-            }
-        }
+fn put(img: &mut RgbImage, x: i32, y: i32, c: Rgb<u8>) {
+    if x >= 0 && y >= 0 && (x as u32) < img.width() && (y as u32) < img.height() {
+        img.put_pixel(x as u32, y as u32, c);
     }
+}
 
-    let axis_color = Rgba([0u8, 0u8, 0u8, 255u8]);
-    let cy = center_y as i32;
-    for x in offset_x..(offset_x + w) {
-        for dy in -1..=1 {
-            let y = cy + dy;
-            if y >= offset_y as i32 && y < (offset_y + h) as i32 {
-                if let Some(pixel) = img.get_pixel_mut_checked(x, y as u32) {
-                    *pixel = axis_color;
-                }
-            }
-        }
-    }
-
-    let cx = center_x as i32;
-    for y in offset_y..(offset_y + h) {
-        for dx in -1..=1 {
-            let x = cx + dx;
-            if x >= offset_x as i32 && x < (offset_x + w) as i32 {
-                if let Some(pixel) = img.get_pixel_mut_checked(x as u32, y) {
-                    *pixel = axis_color;
-                }
-            }
-        }
-    }
-
-    for i in 0..curve.voltage.len() {
-        let v = curve.voltage[i];
-        let c = curve.current[i];
-
-        let x = (center_x + v * scale) as i32;
-        let y = (center_y - c * scale) as i32;
-
-        for dy in -1..=1 {
-            for dx in -1..=1 {
-                let px = x + dx;
-                let py = y + dy;
-
-                if px >= offset_x as i32
-                    && px < (offset_x + w) as i32
-                    && py >= offset_y as i32
-                    && py < (offset_y + h) as i32
-                {
-                    if let Some(pixel) = img.get_pixel_mut_checked(px as u32, py as u32) {
-                        *pixel = curve_color;
-                    }
-                }
+fn line(img: &mut RgbImage, (x0, y0): (f32, f32), (x1, y1): (f32, f32), c: Rgb<u8>, width: i32) {
+    let steps = ((x1 - x0).abs().max((y1 - y0).abs()).ceil() as i32).max(1);
+    let r = width / 2;
+    for s in 0..=steps {
+        let t = s as f32 / steps as f32;
+        let x = (x0 + (x1 - x0) * t).round() as i32;
+        let y = (y0 + (y1 - y0) * t).round() as i32;
+        for dy in -r..=r {
+            for dx in -r..=r {
+                put(img, x + dx, y + dy, c);
             }
         }
     }
 }
 
+/// Dessine une ou plusieurs courbes V-I sur une image carrée à fond blanc.
+pub fn render_xy(traces: &[Trace], size: u32, scale: PlotScale) -> RgbImage {
+    let mut img = RgbImage::from_pixel(size, size, Rgb([255, 255, 255]));
+    let s = size as f32;
+    let grid = Rgb([205, 205, 205]);
+    for k in 0..=10 {
+        let p = k as f32 * (s - 1.0) / 10.0;
+        line(&mut img, (p, 0.0), (p, s - 1.0), grid, 1);
+        line(&mut img, (0.0, p), (s - 1.0, p), grid, 1);
+    }
+    let axis = Rgb([0, 120, 0]);
+    line(&mut img, (s / 2.0, 0.0), (s / 2.0, s - 1.0), axis, 1);
+    line(&mut img, (0.0, s / 2.0), (s - 1.0, s / 2.0), axis, 1);
+
+    for tr in traces {
+        let pts: Vec<(f32, f32)> = match scale {
+            PlotScale::Fixed if tr.curve.has_raw() => tr
+                .curve
+                .raw_voltage
+                .iter()
+                .zip(&tr.curve.raw_current)
+                .filter(|(v, i)| **v > 0 && **i > 0)
+                .map(|(&v, &i)| (v as f32 / 4095.0 * (s - 1.0), (1.0 - i as f32 / 4095.0) * (s - 1.0)))
+                .collect(),
+            _ => tr
+                .curve
+                .voltage
+                .iter()
+                .zip(&tr.curve.current)
+                .map(|(&v, &i)| (s / 2.0 + v * s * 0.45, s / 2.0 - i * s * 0.45))
+                .collect(),
+        };
+        let c = Rgb(tr.color);
+        for w in pts.windows(2) {
+            line(&mut img, w[0], w[1], c, tr.width);
+        }
+    }
+    img
+}
+
+/// Enregistre une image ; le format dépend de l'extension (png, jpg, bmp, gif).
+pub fn save_image(img: &RgbImage, path: &str) -> Result<(), String> {
+    img.save(path).map_err(|e| format!("Erreur sauvegarde image {}: {}", path, e))
+}
+
+/// Export texte constructeur (« Save As Text ») : 512 lignes de tension
+/// (CH1) puis 512 lignes de courant (CH2), valeurs ADC brutes.
+pub fn curve_to_text(curve: &CurveData) -> Result<String, String> {
+    if !curve.has_raw() {
+        return Err("Courbe sans données brutes".to_string());
+    }
+    let mut s = String::new();
+    for v in &curve.raw_voltage {
+        s.push_str(&format!("{}\r\n", v));
+    }
+    for i in &curve.raw_current {
+        s.push_str(&format!("{}\r\n", i));
+    }
+    Ok(s)
+}
+
+pub fn save_curve_text(curve: &CurveData, path: &str) -> Result<(), String> {
+    std::fs::write(path, curve_to_text(curve)?).map_err(|e| format!("{}: {}", path, e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_export_layout() {
+        let c = CurveData::from_raw(0, vec![1, 2, 3], vec![4, 5, 6]).unwrap();
+        assert_eq!(curve_to_text(&c).unwrap(), "1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n");
+    }
+
+    #[test]
+    fn render_does_not_panic_on_edges() {
+        let c = CurveData::from_raw(0, vec![0, 4095, 2048, 1], vec![4095, 0, 2048, 1]).unwrap();
+        let img = render_xy(&[Trace { curve: &c, color: [255, 0, 0], width: 3 }], 50, PlotScale::Fixed);
+        assert_eq!(img.width(), 50);
+        let img = render_xy(&[Trace { curve: &c, color: [255, 0, 0], width: 3 }], 50, PlotScale::Auto);
+        assert_eq!(img.height(), 50);
+    }
+}

@@ -7,7 +7,7 @@ Ce dossier contient un simulateur indépendant du boîtier CT220S.
 Le viewer principal écoute en TCP sur `127.0.0.1:3000` et le simulateur s'y connecte.
 Le simulateur génère exactement le format de courbe attendu par le viewer :
 
-- 1 rapport de 64 octets : `F0 FF <canal> ...`
+- 1 rapport de configuration de 64 octets : `F0 FF <canal> ...` (état complet du boîtier)
 - 32 rapports de 64 octets
 - 512 points, chaque point = `courant u16 LE` + `tension u16 LE`
 
@@ -45,4 +45,4 @@ Chaque canal CH0 / CH1 peut être configuré indépendamment :
 - D : diode
 - Dz : diode Zener
 
-Le viewer peut piloter directement la configuration du simulateur avec les mêmes rapports que le boîtier réel : FA (mode), FB (résistance source), FC (fréquence) et FD (tension). Le simulateur met alors automatiquement à jour ses valeurs de configuration. Aucun protocole spécifique au simulateur n'est ajouté.
+Le viewer pilote le simulateur avec les mêmes commandes que le boîtier réel (voir PROTOCOL.md). Le simulateur renvoie une trame de configuration complète (option décochable pour tester l’ancien en-tête) et peut simuler une surtension ou les balayages.

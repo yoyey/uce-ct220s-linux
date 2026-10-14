@@ -1,416 +1,452 @@
 // src/backend.rs
+//
+// Transports : USB HID (boîtier réel), fichier de capture et simulateur TCP.
+// Les trois utilisent le même assembleur de trames que le logiciel constructeur.
 
 use crate::config::*;
-use crate::curve::{parse_and_normalize_curve_data, CurveData, DualCurveData};
+pub use crate::ct220s_vendor::Command;
+use crate::ct220s_vendor::{AssemblerEvent, FrameAssembler};
+use crate::curve::{CurveData, DualCurveData};
 
 use hidapi::{HidApi, HidDevice};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-/// Commandes disponibles pour le CT220S
-#[derive(Debug, Clone, Copy)]
-pub enum Command {
-    SetFreq(u8), // FC
-    SetRes(u8),  // FB
-    #[allow(dead_code)]
-    SetMode(u8), // FA - conservé pour le protocole USB
-    SetVolt(u8), // FD
-}
+pub type SharedCurves = Arc<Mutex<DualCurveData>>;
+pub type SharedStatus = Arc<Mutex<Option<String>>>;
 
-/// Backend HID pour envoyer des commandes
-pub struct HidBackend {
-    device: Arc<Mutex<HidDevice>>,
-}
-
-/// Construit exactement le même rapport HID que celui envoyé au vrai boîtier.
+/// Construit le rapport HID de 65 octets envoyé au boîtier (et au simulateur).
 pub fn encode_command_report(cmd: Command) -> [u8; READ_SIZE] {
-    let (prefix, index) = match cmd {
-        Command::SetFreq(i) => (0xFCu8, i),
-        Command::SetRes(i) => (0xFBu8, i),
-        Command::SetMode(i) => (0xFAu8, i),
-        Command::SetVolt(i) => (0xFDu8, i),
-    };
+    cmd.encode()
+}
 
-    let mut buf = [0u8; READ_SIZE];
-    buf[0] = 0; // Report ID HID
-    buf[1] = prefix;
-    buf[2] = index;
-    buf
+fn set_status(status: &SharedStatus, msg: Option<String>) {
+    if let Ok(mut s) = status.lock() {
+        *s = msg;
+    }
+}
+
+/// Applique un évènement de l'assembleur à l'état partagé.
+fn apply_event(event: AssemblerEvent, curves: &SharedCurves) -> bool {
+    match event {
+        AssemblerEvent::Config(cfg) => {
+            if let Ok(mut c) = curves.lock() {
+                c.store_config(cfg);
+            }
+            false
+        }
+        AssemblerEvent::Frame(frame) => {
+            match CurveData::from_raw(frame.channel, frame.voltage, frame.current) {
+                Ok(curve) => {
+                    if let Ok(mut c) = curves.lock() {
+                        c.store_curve(curve);
+                    }
+                    true
+                }
+                Err(_) => false,
+            }
+        }
+        AssemblerEvent::Pending | AssemblerEvent::Ignored => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// USB HID
+// ---------------------------------------------------------------------------
+
+/// Accès HID partagé. Le périphérique peut être absent : le thread de lecture
+/// tente alors de le rouvrir toutes les secondes (reconnexion à chaud, comme le
+/// timer du logiciel constructeur).
+#[derive(Clone)]
+pub struct HidBackend {
+    device: Arc<Mutex<Option<HidDevice>>>,
 }
 
 impl HidBackend {
-    /// Créer un nouveau backend HID
-    pub fn new() -> Result<Self, String> {
-        let api = HidApi::new().map_err(|e| format!("Erreur HidApi: {}", e))?;
-        
-        println!("Recherche du CT220S...");
-        let device = api
-            .open(VID, PID)
-            .map_err(|e| format!("Impossible d'ouvrir le périphérique: {}", e))?;
-        
-        println!("Périphérique ouvert pour les commandes.");
-        
-        Ok(Self {
-            device: Arc::new(Mutex::new(device)),
-        })
+    pub fn new() -> Self {
+        Self { device: Arc::new(Mutex::new(None)) }
     }
 
-    /// Envoyer une commande au boîtier
+    pub fn is_connected(&self) -> bool {
+        self.device.lock().map(|d| d.is_some()).unwrap_or(false)
+    }
+
     pub fn send_cmd(&self, cmd: Command) -> Result<(), String> {
         let buf = encode_command_report(cmd);
-        let device = self.device.lock().unwrap();
-        device.write(&buf).map_err(|e| e.to_string())?;
-
-        println!(
-            "Cmd HID envoyée: prefix=0x{:02X}, index={}",
-            buf[1], buf[2]
-        );
+        let mut guard = self.device.lock().map_err(|_| "verrou HID empoisonné".to_string())?;
+        let device = guard.as_ref().ok_or_else(|| "Boîtier USB non connecté".to_string())?;
+        if let Err(e) = device.write(&buf) {
+            *guard = None;
+            return Err(e.to_string());
+        }
+        println!("Cmd HID envoyée: {:02X} {:02X}", buf[1], buf[2]);
         Ok(())
     }
 
-    /// Clone le device pour le reader thread
-    pub fn clone_device(&self) -> Arc<Mutex<HidDevice>> {
+    pub fn device_handle(&self) -> Arc<Mutex<Option<HidDevice>>> {
         Arc::clone(&self.device)
     }
 }
 
-/// Lecture HID en continu (mode réel)
+/// Lecture HID en continu. Le verrou n'est tenu que pendant une lecture
+/// courte (timeout 50 ms) afin que les commandes puissent toujours passer.
 pub fn run_hid_reader(
-    device: Arc<Mutex<HidDevice>>,
-    curve_data: Arc<Mutex<DualCurveData>>,
-    error_message: Arc<Mutex<Option<String>>>,
-    running: Arc<Mutex<bool>>,
+    device: Arc<Mutex<Option<HidDevice>>>,
+    curves: SharedCurves,
+    status: SharedStatus,
+    running: Arc<AtomicBool>,
 ) -> Result<(), String> {
-    *error_message.lock().unwrap() = Some("Lecture en cours...".to_string());
+    let api = HidApi::new().map_err(|e| format!("Erreur HidApi: {}", e))?;
+    let mut assembler = FrameAssembler::new();
+    let mut last_attempt: Option<Instant> = None;
 
-    while *running.lock().unwrap() {
-        let curve = {
-            let dev = device.lock().unwrap();
-            read_one_curve(&*dev)
-        };
-
-        match curve {
-            Ok(curve) => {
-                let mut data = curve_data.lock().unwrap();
-                if curve.channel == 0 {
-                    data.channel0 = Some(curve);
-                } else {
-                    data.channel1 = Some(curve);
+    while running.load(Ordering::Relaxed) {
+        let connected = device.lock().map(|d| d.is_some()).unwrap_or(false);
+        if !connected {
+            if last_attempt.map_or(true, |t| t.elapsed() >= Duration::from_secs(1)) {
+                last_attempt = Some(Instant::now());
+                match api.open(VID, PID) {
+                    Ok(dev) => {
+                        println!("CT220S ouvert.");
+                        assembler.reset();
+                        if let Ok(mut d) = device.lock() {
+                            *d = Some(dev);
+                        }
+                        set_status(&status, Some("Périphérique USB connecté".into()));
+                    }
+                    Err(e) => {
+                        set_status(&status, Some(format!("Boîtier USB absent ({})", e)));
+                    }
                 }
-                *error_message.lock().unwrap() = None;
             }
-            Err(e) => {
-                eprintln!("Erreur de lecture: {}", e);
-                *error_message.lock().unwrap() = Some(format!("Erreur: {}", e));
-            }
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-
-    Ok(())
-}
-
-/// Lecture depuis un fichier de capture (mode simulation)
-pub fn run_file_reader(
-    file_path: &str,
-    curve_data: Arc<Mutex<DualCurveData>>,
-    error_message: Arc<Mutex<Option<String>>>,
-    running: Arc<Mutex<bool>>,
-) -> Result<(), String> {
-    let file = File::open(file_path)
-        .map_err(|e| format!("Impossible d'ouvrir {}: {}", file_path, e))?;
-    let reader = BufReader::new(file);
-
-    let mut reports: Vec<Vec<u8>> = Vec::new();
-
-    for line in reader.lines() {
-        let line = line.map_err(|e| format!("Erreur lecture ligne: {}", e))?;
-        let line = line.trim();
-
-        if line.is_empty() || line.starts_with('#') {
+            thread::sleep(Duration::from_millis(100));
             continue;
         }
 
+        let mut buf = [0u8; READ_SIZE];
+        let result = {
+            let guard = match device.lock() {
+                Ok(g) => g,
+                Err(_) => break,
+            };
+            match guard.as_ref() {
+                Some(dev) => dev.read_timeout(&mut buf, 50),
+                None => continue,
+            }
+        };
+
+        match result {
+            Ok(0) => {}
+            Ok(n) => {
+                if let Ok(ev) = assembler.push_report(&buf[..n]) {
+                    if apply_event(ev, &curves) {
+                        set_status(&status, None);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Erreur de lecture HID: {}", e);
+                if let Ok(mut d) = device.lock() {
+                    *d = None;
+                }
+                if let Ok(mut c) = curves.lock() {
+                    c.clear();
+                    c.config = None;
+                }
+                set_status(&status, Some(format!("USB déconnecté : {}", e)));
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Fichier de capture
+// ---------------------------------------------------------------------------
+
+pub fn load_capture_reports(file_path: &str) -> Result<Vec<Vec<u8>>, String> {
+    let file = File::open(file_path).map_err(|e| format!("Impossible d'ouvrir {}: {}", file_path, e))?;
+    let mut reports = Vec::new();
+    for line in BufReader::new(file).lines() {
+        let line = line.map_err(|e| format!("Erreur lecture ligne: {}", e))?;
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
         let bytes = parse_hex_line(line)?;
-        if !bytes.is_empty() {
+        if bytes.len() == READ_SIZE || bytes.len() == REPORT_DATA_SIZE {
             reports.push(bytes);
         }
     }
-
     if reports.is_empty() {
         return Err("Aucune donnée trouvée dans le fichier".to_string());
     }
+    Ok(reports)
+}
 
+/// Rejoue une capture en boucle (une courbe toutes les 50 ms).
+pub fn run_file_reader(
+    file_path: &str,
+    curves: SharedCurves,
+    status: SharedStatus,
+    running: Arc<AtomicBool>,
+) -> Result<(), String> {
+    let reports = match load_capture_reports(file_path) {
+        Ok(r) => r,
+        Err(e) => {
+            set_status(&status, Some(e.clone()));
+            return Err(e);
+        }
+    };
     println!("Chargé {} rapports du fichier", reports.len());
-    *error_message.lock().unwrap() = Some(format!("Fichier chargé: {} rapports", reports.len()));
+    set_status(&status, Some(format!("Fichier chargé: {} rapports", reports.len())));
 
-    let mut report_idx = 0;
-    while *running.lock().unwrap() {
-        match read_one_curve_from_reports(&reports, &mut report_idx) {
-            Ok(curve) => {
-                let mut data = curve_data.lock().unwrap();
-                if curve.channel == 0 {
-                    data.channel0 = Some(curve);
-                } else {
-                    data.channel1 = Some(curve);
-                }
-                *error_message.lock().unwrap() = None;
+    let mut assembler = FrameAssembler::new();
+    let mut frames_this_pass = 0usize;
+    let mut idx = 0usize;
+    while running.load(Ordering::Relaxed) {
+        if idx >= reports.len() {
+            if frames_this_pass == 0 {
+                let msg = "Capture sans courbe complète (en-tête F0 FF + rapports)".to_string();
+                set_status(&status, Some(msg.clone()));
+                return Err(msg);
             }
-            Err(e) => {
-                eprintln!("Erreur lecture courbe: {}", e);
-                *error_message.lock().unwrap() = Some(format!("Erreur: {}", e));
-                report_idx = 0;
+            idx = 0;
+            frames_this_pass = 0;
+        }
+        let ev = assembler.push_report(&reports[idx]);
+        idx += 1;
+        if let Ok(ev) = ev {
+            if apply_event(ev, &curves) {
+                frames_this_pass += 1;
+                set_status(&status, None);
+                thread::sleep(Duration::from_millis(50));
             }
         }
-        thread::sleep(Duration::from_millis(50));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Simulateur TCP
+// ---------------------------------------------------------------------------
+
+/// Envoie au simulateur TCP exactement le même rapport 65 octets qu'en HID.
+pub fn send_tcp_cmd(command_stream: &Arc<Mutex<Option<TcpStream>>>, cmd: Command) -> Result<(), String> {
+    let report = encode_command_report(cmd);
+    let mut guard = command_stream.lock().map_err(|_| "verrou TCP empoisonné".to_string())?;
+    let stream = guard.as_mut().ok_or_else(|| "Simulateur TCP non connecté".to_string())?;
+    if let Err(e) = stream.write_all(&report) {
+        *guard = None;
+        return Err(e.to_string());
+    }
+    println!("Cmd TCP envoyée: {:02X} {:02X}", report[1], report[2]);
+    Ok(())
+}
+
+/// Découpe un flux d'octets en rapports de 64 octets. Tant que l'alignement
+/// n'est pas connu, on recherche `F0 FF` à n'importe quelle position : cette
+/// séquence ne peut pas apparaître dans les données (valeurs ADC <= 0x0FFF).
+#[derive(Default)]
+pub struct StreamFramer {
+    buffer: Vec<u8>,
+    synced: bool,
+}
+
+impl StreamFramer {
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    Ok(())
+    pub fn push(&mut self, bytes: &[u8]) {
+        self.buffer.extend_from_slice(bytes);
+    }
+
+    pub fn next_report(&mut self) -> Option<[u8; REPORT_DATA_SIZE]> {
+        if !self.synced {
+            let pos = self.buffer.windows(2).position(|w| w == HEADER_MAGIC)?;
+            self.buffer.drain(..pos);
+            self.synced = true;
+        }
+        if self.buffer.len() < REPORT_DATA_SIZE {
+            return None;
+        }
+        let mut report = [0u8; REPORT_DATA_SIZE];
+        report.copy_from_slice(&self.buffer[..REPORT_DATA_SIZE]);
+        self.buffer.drain(..REPORT_DATA_SIZE);
+        Some(report)
+    }
+
+    pub fn resync(&mut self) {
+        self.synced = false;
+    }
 }
 
-
-/// Envoie au simulateur TCP exactement le même rapport 65 octets que
-/// celui utilisé par HID pour le vrai boîtier (Report ID + FA/FB/FC/FD).
-pub fn send_tcp_cmd(
-    command_stream: &Arc<Mutex<Option<TcpStream>>>,
-    cmd: Command,
-) -> Result<(), String> {
-    let report = encode_command_report(cmd);
-    let mut guard = command_stream.lock().unwrap();
-    let stream = guard
-        .as_mut()
-        .ok_or_else(|| "Simulateur TCP non connecté".to_string())?;
-    stream.write_all(&report).map_err(|e| e.to_string())?;
-    println!(
-        "Cmd TCP envoyée (protocole HID inchangé): prefix=0x{:02X}, index={}",
-        report[1], report[2]
-    );
-    Ok(())
-}
-
-/// Lecture de courbes via TCP (simulateur externe).
-///
-/// Le protocole est volontairement simple et reprend les rapports HID bruts :
-/// - 1 rapport de 64 octets commençant par F0 FF, octet 2 = canal
-/// - 32 rapports de 64 octets contenant 512 couples (I,V) u16 little-endian
-///
-/// Le viewer écoute sur `address` (par défaut 127.0.0.1:3000 avec --tcp).
+/// Le viewer écoute sur `address` (127.0.0.1:3000 par défaut avec --tcp).
 pub fn run_tcp_reader(
     address: &str,
-    curve_data: Arc<Mutex<DualCurveData>>,
-    error_message: Arc<Mutex<Option<String>>>,
-    running: Arc<Mutex<bool>>,
+    curves: SharedCurves,
+    status: SharedStatus,
+    running: Arc<AtomicBool>,
     command_stream: Arc<Mutex<Option<TcpStream>>>,
 ) -> Result<(), String> {
-    let listener = TcpListener::bind(address)
-        .map_err(|e| format!("Impossible d'écouter sur {}: {}", address, e))?;
+    let listener = TcpListener::bind(address).map_err(|e| format!("Impossible d'écouter sur {}: {}", address, e))?;
     listener
         .set_nonblocking(true)
         .map_err(|e| format!("Impossible de passer le socket en non-bloquant: {}", e))?;
 
     println!("Mode simulateur TCP: écoute sur {}", address);
-    *error_message.lock().unwrap() = Some(format!("Simulation TCP: attente sur {}", address));
+    set_status(&status, Some(format!("Simulation TCP: attente sur {}", address)));
 
-    while *running.lock().unwrap() {
+    while running.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((mut stream, peer)) => {
                 println!("Simulateur connecté depuis {}", peer);
-                *error_message.lock().unwrap() =
-                    Some(format!("Simulateur connecté: {}", peer));
+                set_status(&status, Some(format!("Simulateur connecté: {}", peer)));
 
-                let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
+                // Sous Windows, le socket accepté hérite du mode non bloquant de
+                // l'écouteur : read/write renverraient WouldBlock au milieu
+                // d'une trame. On repasse explicitement en mode bloquant.
+                let _ = stream.set_nonblocking(false);
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
                 let _ = stream.set_nodelay(true);
 
                 match stream.try_clone() {
                     Ok(writer) => {
                         let _ = writer.set_nodelay(true);
-                        *command_stream.lock().unwrap() = Some(writer);
+                        if let Ok(mut c) = command_stream.lock() {
+                            *c = Some(writer);
+                        }
                     }
                     Err(e) => {
-                        *error_message.lock().unwrap() = Some(format!("Erreur clone TCP: {}", e));
+                        set_status(&status, Some(format!("Erreur clone TCP: {}", e)));
                         continue;
                     }
                 }
 
-                while *running.lock().unwrap() {
-                    match read_one_curve_tcp(&mut stream) {
-                        Ok(curve) => {
-                            let mut data = curve_data.lock().unwrap();
-                            if curve.channel == 0 {
-                                data.channel0 = Some(curve);
-                            } else {
-                                data.channel1 = Some(curve);
-                            }
-                            *error_message.lock().unwrap() = None;
+                let mut framer = StreamFramer::new();
+                let mut assembler = FrameAssembler::new();
+                let mut tmp = [0u8; 4096];
+                while running.load(Ordering::Relaxed) {
+                    match stream.read(&mut tmp) {
+                        Ok(0) => {
+                            println!("Simulateur TCP déconnecté");
+                            break;
                         }
-                        Err(e) => {
+                        Ok(n) => {
+                            framer.push(&tmp[..n]);
+                            while let Some(report) = framer.next_report() {
+                                match assembler.push_payload(&report) {
+                                    Ok(AssemblerEvent::Ignored) => framer.resync(),
+                                    Ok(ev) => {
+                                        if apply_event(ev, &curves) {
+                                            set_status(&status, None);
+                                        }
+                                    }
+                                    Err(_) => framer.resync(),
+                                }
+                            }
+                        }
+                        Err(e)
                             if e.kind() == std::io::ErrorKind::WouldBlock
                                 || e.kind() == std::io::ErrorKind::TimedOut
-                            {
-                                continue;
-                            }
-
+                                || e.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(e) => {
                             println!("Simulateur TCP déconnecté: {}", e);
-                            *command_stream.lock().unwrap() = None;
-                            *error_message.lock().unwrap() =
-                                Some(format!("Simulation TCP: attente sur {}", address));
                             break;
                         }
                     }
                 }
+                if let Ok(mut c) = command_stream.lock() {
+                    *c = None;
+                }
+                set_status(&status, Some(format!("Simulation TCP: attente sur {}", address)));
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(100));
             }
-            Err(e) => {
-                return Err(format!("Erreur accept TCP: {}", e));
-            }
+            Err(e) => return Err(format!("Erreur accept TCP: {}", e)),
         }
     }
 
-    *command_stream.lock().unwrap() = None;
+    if let Ok(mut c) = command_stream.lock() {
+        *c = None;
+    }
     Ok(())
 }
 
-fn read_one_curve_tcp(stream: &mut TcpStream) -> std::io::Result<CurveData> {
-    // Le flux est découpé en rapports fixes de 64 octets. On resynchronise
-    // simplement jusqu'à retrouver F0 FF.
-    let channel_id = loop {
-        let mut header = [0u8; REPORT_DATA_SIZE];
-        stream.read_exact(&mut header)?;
-        if header[0] == HEADER_MAGIC[0] && header[1] == HEADER_MAGIC[1] {
-            break header[2];
-        }
-    };
-
-    let mut data_bytes = vec![0u8; REPORTS_PER_CURVE * REPORT_DATA_SIZE];
-    stream.read_exact(&mut data_bytes)?;
-
-    let (v_norm, i_norm) = parse_and_normalize_curve_data(&data_bytes)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-    Ok(CurveData {
-        voltage: v_norm,
-        current: i_norm,
-        channel: channel_id,
-    })
-}
-
-/// Parsing d'une ligne hex (capture fichier)
+/// Parsing d'une ligne hex (capture fichier).
 fn parse_hex_line(line: &str) -> Result<Vec<u8>, String> {
-    let mut bytes = Vec::new();
-
     let clean: String = line.chars().filter(|c| c.is_ascii_hexdigit()).collect();
-
+    let mut bytes = Vec::with_capacity(clean.len() / 2);
     for i in (0..clean.len()).step_by(2) {
         if i + 1 < clean.len() {
-            let byte_str = &clean[i..i + 2];
-            let byte = u8::from_str_radix(byte_str, 16)
-                .map_err(|e| format!("Erreur parsing hex '{}': {}", byte_str, e))?;
-            bytes.push(byte);
+            let s = &clean[i..i + 2];
+            bytes.push(u8::from_str_radix(s, 16).map_err(|e| format!("Erreur parsing hex '{}': {}", s, e))?);
         }
     }
-
     Ok(bytes)
 }
 
-fn extract_payload(report: &[u8]) -> Option<Vec<u8>> {
-    if report.is_empty() {
-        return None;
-    }
+#[cfg(test)]
+mod protocol_tests {
+    use super::*;
 
-    if report.len() == READ_SIZE {
-        Some(report[1..].to_vec())
-    } else if report.len() == REPORT_DATA_SIZE {
-        Some(report.to_vec())
-    } else {
-        None
-    }
-}
-
-fn read_one_curve_from_reports(
-    reports: &[Vec<u8>],
-    start_idx: &mut usize,
-) -> Result<CurveData, String> {
-    let channel_id = loop {
-        if *start_idx >= reports.len() {
-            return Err("Pas de header trouvé".to_string());
+    #[test]
+    fn existing_hid_tcp_command_wire_format() {
+        for (cmd, opcode, value) in [
+            (Command::SetMode(1), 0xFF, 1),
+            (Command::SetRes(2), 0xFB, 2),
+            (Command::SetFreq(3), 0xFC, 3),
+            (Command::SetVolt(4), 0xFD, 4),
+        ] {
+            let report = encode_command_report(cmd);
+            assert_eq!(report.len(), READ_SIZE);
+            assert_eq!(&report[..3], &[0, opcode, value]);
+            assert!(report[3..].iter().all(|&b| b == 0));
         }
+    }
 
-        if let Some(payload) = extract_payload(&reports[*start_idx]) {
-            if payload.len() >= 3
-                && payload[0] == HEADER_MAGIC[0]
-                && payload[1] == HEADER_MAGIC[1]
-            {
-                *start_idx += 1;
-                break payload[2];
+    fn frame_bytes(channel: u8) -> Vec<u8> {
+        let mut v = vec![0u8; REPORT_DATA_SIZE];
+        v[..3].copy_from_slice(&[0xF0, 0xFF, channel]);
+        for k in 0..512u16 {
+            v.extend_from_slice(&(2048 + (k % 7)).to_le_bytes());
+            v.extend_from_slice(&(1000 + k).to_le_bytes());
+        }
+        v
+    }
+
+    #[test]
+    fn framer_resyncs_after_garbage_and_split_reads() {
+        let mut stream = vec![0x12, 0x34, 0x56];
+        stream.extend(frame_bytes(1));
+        stream.extend(frame_bytes(0));
+        let mut framer = StreamFramer::new();
+        let mut asm = FrameAssembler::new();
+        let mut frames = Vec::new();
+        for chunk in stream.chunks(37) {
+            framer.push(chunk);
+            while let Some(r) = framer.next_report() {
+                if let Ok(AssemblerEvent::Frame(f)) = asm.push_payload(&r) {
+                    frames.push(f);
+                }
             }
         }
-
-        *start_idx += 1;
-    };
-
-    let mut data_bytes = Vec::with_capacity(REPORTS_PER_CURVE * REPORT_DATA_SIZE);
-    for i in 0..REPORTS_PER_CURVE {
-        if let Some(payload) = extract_payload(&reports[*start_idx + i]) {
-            data_bytes.extend_from_slice(&payload);
-        } else {
-            return Err("Payload invalide".to_string());
-        }
-    }
-    *start_idx += REPORTS_PER_CURVE;
-
-    let (v_norm, i_norm) = parse_and_normalize_curve_data(&data_bytes)?;
-
-    Ok(CurveData {
-        voltage: v_norm,
-        current: i_norm,
-        channel: channel_id,
-    })
-}
-
-fn read_one_curve(device: &HidDevice) -> Result<CurveData, String> {
-    // Attendre le header et récupérer directement le canal.
-    let channel_id = loop {
-        let mut buf = [0u8; READ_SIZE];
-        let n = device
-            .read(&mut buf)
-            .map_err(|e| format!("Erreur de lecture: {}", e))?;
-
-        if let Some(payload) = extract_payload(&buf[..n]) {
-            if payload.len() >= 3
-                && payload[0] == HEADER_MAGIC[0]
-                && payload[1] == HEADER_MAGIC[1]
-            {
-                break payload[2];
-            }
-        }
-    };
-
-    // Lire les données
-    let mut data_bytes = Vec::with_capacity(REPORTS_PER_CURVE * REPORT_DATA_SIZE);
-    for _ in 0..REPORTS_PER_CURVE {
-        let mut buf = [0u8; READ_SIZE];
-        let n = device
-            .read(&mut buf)
-            .map_err(|e| format!("Erreur de lecture: {}", e))?;
-
-        if let Some(payload) = extract_payload(&buf[..n]) {
-            data_bytes.extend_from_slice(&payload);
-        } else {
-            return Err("Payload invalide".to_string());
-        }
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].channel, 1);
+        assert_eq!(frames[1].channel, 0);
+        assert_eq!(frames[0].voltage[10], 1010);
+        assert_eq!(frames[0].current[10], 2048 + 3);
     }
 
-    let (v_norm, i_norm) = parse_and_normalize_curve_data(&data_bytes)?;
-
-    Ok(CurveData {
-        voltage: v_norm,
-        current: i_norm,
-        channel: channel_id,
-    })
+    #[test]
+    fn hex_line_parsing() {
+        assert_eq!(parse_hex_line("F0 ff-0a").unwrap(), vec![0xF0, 0xFF, 0x0A]);
+    }
 }

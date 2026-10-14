@@ -1,19 +1,96 @@
 // src/curve.rs
 
 use crate::config::POINTS_PER_CURVE;
+use crate::ct220s_vendor::VendorConfig;
 use byteorder::{ByteOrder, LittleEndian};
 use std::f32::consts::PI;
+use std::time::Instant;
 
-#[derive(Clone)]
-pub struct CurveData {
-    pub voltage: Vec<f32>,
-    pub current: Vec<f32>,
-    pub channel: u8,
+/// Paramètres permettant de revenir des coordonnées normalisées aux points ADC.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Normalization {
+    pub center_v: f32,
+    pub center_i: f32,
+    pub scale: f32,
 }
 
+impl Default for Normalization {
+    fn default() -> Self {
+        Self { center_v: 2048.0, center_i: 2048.0, scale: 2048.0 }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CurveData {
+    /// Tension normalisée (centrée sur la médiane, échelle commune V/I).
+    pub voltage: Vec<f32>,
+    /// Courant normalisé (même échelle que la tension).
+    pub current: Vec<f32>,
+    pub channel: u8,
+    /// Valeurs ADC brutes 12 bits (CH1 constructeur). Vide pour une
+    /// référence chargée depuis l'ancien format CSV V1.
+    pub raw_voltage: Vec<u16>,
+    /// Valeurs ADC brutes 12 bits (CH2 constructeur).
+    pub raw_current: Vec<u16>,
+    pub norm: Normalization,
+    /// Numéro de réception, incrémenté à chaque nouvelle courbe.
+    pub seq: u64,
+}
+
+impl CurveData {
+    pub fn from_raw(channel: u8, raw_voltage: Vec<u16>, raw_current: Vec<u16>) -> Result<Self, String> {
+        let n = raw_voltage.len().min(raw_current.len());
+        if n == 0 {
+            return Err("Aucune paire de données extraite".to_string());
+        }
+        let (voltage, current, norm) = normalize(&raw_voltage[..n], &raw_current[..n]);
+        Ok(Self {
+            voltage,
+            current,
+            channel,
+            raw_voltage: raw_voltage[..n].to_vec(),
+            raw_current: raw_current[..n].to_vec(),
+            norm,
+            seq: 0,
+        })
+    }
+
+    pub fn from_normalized(channel: u8, voltage: Vec<f32>, current: Vec<f32>) -> Self {
+        Self {
+            voltage,
+            current,
+            channel,
+            raw_voltage: Vec::new(),
+            raw_current: Vec::new(),
+            norm: Normalization::default(),
+            seq: 0,
+        }
+    }
+
+    pub fn has_raw(&self) -> bool {
+        !self.raw_voltage.is_empty() && self.raw_voltage.len() == self.raw_current.len()
+    }
+
+    /// Coordonnées normalisées -> points ADC (tension, courant).
+    pub fn normalized_to_adc(&self, v: f32, i: f32) -> (f64, f64) {
+        (
+            (v * self.norm.scale + self.norm.center_v) as f64,
+            (i * self.norm.scale + self.norm.center_i) as f64,
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct DualCurveData {
     pub channel0: Option<CurveData>,
     pub channel1: Option<CurveData>,
+    /// Dernière configuration `F0 FF` reçue.
+    pub config: Option<VendorConfig>,
+    /// Incrémenté à chaque configuration reçue.
+    pub config_seq: u64,
+    /// Nombre total de courbes reçues (sert aussi de numéro de séquence).
+    pub frame_count: u64,
+    pub last_frame: Option<Instant>,
 }
 
 impl DualCurveData {
@@ -21,7 +98,38 @@ impl DualCurveData {
         Self {
             channel0: None,
             channel1: None,
+            config: None,
+            config_seq: 0,
+            frame_count: 0,
+            last_frame: None,
         }
+    }
+
+    pub fn store_curve(&mut self, mut curve: CurveData) {
+        self.frame_count += 1;
+        curve.seq = self.frame_count;
+        self.last_frame = Some(Instant::now());
+        if curve.channel == 0 {
+            self.channel0 = Some(curve);
+        } else {
+            self.channel1 = Some(curve);
+        }
+    }
+
+    pub fn store_config(&mut self, config: VendorConfig) {
+        self.config = Some(config);
+        self.config_seq += 1;
+    }
+
+    pub fn clear(&mut self) {
+        self.channel0 = None;
+        self.channel1 = None;
+    }
+}
+
+impl Default for DualCurveData {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -38,64 +146,61 @@ pub struct ElectricalValues {
     pub phase_deg: Option<f32>,
 }
 
-/// Parse les bytes bruts d'une courbe + normalisation comme dans le script Python.
-/// Retourne (V_norm, I_norm).
-pub fn parse_and_normalize_curve_data(data_bytes: &[u8]) -> Result<(Vec<f32>, Vec<f32>), String> {
-    let raw_len = (POINTS_PER_CURVE * 4).min(data_bytes.len());
-    let raw = &data_bytes[..raw_len];
-
-    let mut pairs = Vec::with_capacity(POINTS_PER_CURVE);
-
-    for i in 0..(raw.len() / 4).min(POINTS_PER_CURVE) {
-        let offset = i * 4;
-        let current_raw = LittleEndian::read_u16(&raw[offset..offset + 2]) as f32;
-        let voltage_raw = LittleEndian::read_u16(&raw[offset + 2..offset + 4]) as f32;
-        pairs.push((current_raw, voltage_raw));
+fn median(sorted: &[f32]) -> f32 {
+    let n = sorted.len();
+    if n == 0 {
+        return 0.0;
     }
-
-    if pairs.is_empty() {
-        return Err("Aucune paire de données extraite".to_string());
+    if n % 2 == 0 {
+        (sorted[n / 2 - 1] + sorted[n / 2]) * 0.5
+    } else {
+        sorted[n / 2]
     }
-
-    let mut currents: Vec<f32> = pairs.iter().map(|(c, _)| *c).collect();
-    let mut voltages: Vec<f32> = pairs.iter().map(|(_, v)| *v).collect();
-
-    currents.sort_by(|a, b| a.total_cmp(b));
-    voltages.sort_by(|a, b| a.total_cmp(b));
-
-    // Pour 512 points, np.median() fait la moyenne des deux valeurs centrales.
-    fn median(sorted: &[f32]) -> f32 {
-        let n = sorted.len();
-        if n % 2 == 0 {
-            (sorted[n / 2 - 1] + sorted[n / 2]) * 0.5
-        } else {
-            sorted[n / 2]
-        }
-    }
-
-    let median_current = median(&currents);
-    let median_voltage = median(&voltages);
-
-    let mut i_vec = Vec::with_capacity(pairs.len());
-    let mut v_vec = Vec::with_capacity(pairs.len());
-
-    for (c, v) in pairs {
-        i_vec.push(c - median_current);
-        v_vec.push(v - median_voltage);
-    }
-
-    // Echelle COMMUNE, indispensable pour conserver le rapport V/I et donc
-    // la forme horizontale / verticale du traceur.
-    let max_i = i_vec.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
-    let max_v = v_vec.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
-    let scale = max_i.max(max_v).max(1.0);
-
-    let v_norm: Vec<f32> = v_vec.iter().map(|x| x / scale).collect();
-    let i_norm: Vec<f32> = i_vec.iter().map(|x| x / scale).collect();
-
-    Ok((v_norm, i_norm))
 }
 
+/// Centre sur la médiane et applique une échelle COMMUNE aux deux voies,
+/// indispensable pour conserver le rapport V/I (forme du traceur).
+fn normalize(raw_v: &[u16], raw_i: &[u16]) -> (Vec<f32>, Vec<f32>, Normalization) {
+    let mut vs: Vec<f32> = raw_v.iter().map(|&x| x as f32).collect();
+    let mut is: Vec<f32> = raw_i.iter().map(|&x| x as f32).collect();
+    vs.sort_by(|a, b| a.total_cmp(b));
+    is.sort_by(|a, b| a.total_cmp(b));
+    let center_v = median(&vs);
+    let center_i = median(&is);
+
+    let max_v = raw_v.iter().map(|&x| (x as f32 - center_v).abs()).fold(0.0f32, f32::max);
+    let max_i = raw_i.iter().map(|&x| (x as f32 - center_i).abs()).fold(0.0f32, f32::max);
+    let scale = max_i.max(max_v).max(1.0);
+
+    let v = raw_v.iter().map(|&x| (x as f32 - center_v) / scale).collect();
+    let i = raw_i.iter().map(|&x| (x as f32 - center_i) / scale).collect();
+    (v, i, Normalization { center_v, center_i, scale })
+}
+
+/// Extrait les couples bruts (tension, courant) d'un bloc de rapports.
+/// Chaque point = courant u16 LE puis tension u16 LE.
+pub fn parse_raw_curve_data(data_bytes: &[u8]) -> Result<(Vec<u16>, Vec<u16>), String> {
+    let n = (data_bytes.len() / 4).min(POINTS_PER_CURVE);
+    if n == 0 {
+        return Err("Aucune paire de données extraite".to_string());
+    }
+    let mut v = Vec::with_capacity(n);
+    let mut i = Vec::with_capacity(n);
+    for k in 0..n {
+        let o = 4 * k;
+        i.push(LittleEndian::read_u16(&data_bytes[o..o + 2]));
+        v.push(LittleEndian::read_u16(&data_bytes[o + 2..o + 4]));
+    }
+    Ok((v, i))
+}
+
+/// Parse les bytes bruts d'une courbe + normalisation. Retourne (V_norm, I_norm).
+#[allow(dead_code)]
+pub fn parse_and_normalize_curve_data(data_bytes: &[u8]) -> Result<(Vec<f32>, Vec<f32>), String> {
+    let (v, i) = parse_raw_curve_data(data_bytes)?;
+    let (vn, inorm, _) = normalize(&v, &i);
+    Ok((vn, inorm))
+}
 /// Amplitude et phase du fondamental d'un signal contenant une période complète.
 /// La convention choisie est x[n] = A*cos(theta + phase).
 fn fundamental(samples: &[f32]) -> Option<(f32, f32)> {
